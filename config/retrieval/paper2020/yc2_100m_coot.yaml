@@ -6,21 +6,29 @@ train:
     batch_size: 64
     num_epochs: 100
     loss_func: "contrastive"
+
+    cross_clr_config:
+        temperature: 0.03
+        temperature_weights: 0.0035
+        score_thrshold: 0.9
+        negative_weight: 0.8
+        queue_size: 3000
+
     contrastive_loss_config:
-        margin: 0.2
-        weight_high: 1.0
-        weight_high_internal: 1.0
+        margin: 0.1
+        weight_high: 0.8 #1.0
+        weight_high_internal: 0 #0.1
         weight_low: 1.0
-        weight_low_internal: 1.0
-        weight_context: 1.0
+        weight_low_internal: 0 #0.2
+        weight_context: 0 #0.5 #0.8 #1.0
         weight_context_internal: 0.0        
-    loss_cycle_cons: 0.001
+    loss_cycle_cons: 0 #0.001
     clip_gradient: -1 # Deactivated by default since it takes ~200ms every train step.
 # ---------- Validation ----------
 val:
     batch_size: 64
     val_freq: 1
-    val_start: 3 #0
+    val_start: 0 #0
     val_clips: true
     val_clips_freq: 1
     det_best_field: "val_clip_sent_score_at_1"
@@ -59,8 +67,8 @@ dataset_train:
     add_stop_frame: 2
     expand_segments: 0
     # technical dataloading details
-    preload_vid_feat: false
-    preload_text_feat: false
+    preload_vid_feat: true
+    preload_text_feat: true
     pin_memory: true
     num_workers: 4
     drop_last: false
@@ -173,5 +181,5 @@ cudnn_enabled: true
 cudnn_benchmark: true
 cudnn_deterministic: false
 cuda_non_blocking: true
-fp16_train: true
-fp16_val: true
+fp16_train: false
+fp16_val: false

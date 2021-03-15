@@ -340,7 +340,7 @@ def output_results(
 # ---------- Console table printing ----------
 
 COLOR_DEFAULT = "[39m"
-COLOR_WHITE = "[97m"
+COLOR_WHITE = "[96m"
 
 COLOR_CODE = "\033"
 

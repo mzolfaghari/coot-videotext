@@ -1,14 +1,16 @@
 """
 Loss functions.
 """
-
+import time 
 from typing import Callable, Dict
-
+import numpy as np
 import torch as th
 from torch import nn
+import torch.nn.functional as F
 
 from nntrainer import typext
 from nntrainer.typext import INF
+from coot.clustering import train_kmeans, compute_cluster_assignment, FaissKMeans, MemoryReserver
 
 
 class LossesConst(typext.ConstantHolder):
@@ -47,6 +49,20 @@ class ContrastiveLossConfig(typext.ConfigClass):
         self.weight_context: float = config.pop("weight_context")
         self.weight_context_internal: float = config.pop("weight_context_internal")
 
+class CrossCLRLossConfig(typext.ConfigClass):
+    """
+    Contrastive loss Configuration Class
+
+    Args:
+        config: Configuration dictionary to be loaded, saving part.
+    """
+
+    def __init__(self, config: Dict) -> None:
+        self.temperature: float = config.pop("temperature")
+        self.temperature_weights: float = config.pop("temperature_weights")
+        self.negative_weight: float = config.pop("negative_weight")
+        self.score_thrshold: float = config.pop("score_thrshold")
+        self.queue_size: float = config.pop("queue_size")
 
 class ContrastiveLoss(nn.Module):
     """
@@ -61,7 +77,7 @@ class ContrastiveLoss(nn.Module):
         self.max_violation = max_violation
         self.use_cuda = use_cuda
 
-    def forward(self, im, s):
+    def forward(self, im, s, x=0, y=0):
         """
         Inputs shape (batch, embed_dim)
 
@@ -99,6 +115,572 @@ class ContrastiveLoss(nn.Module):
         if self.norm:
             return (cost_s.sum() + cost_im.sum()).div(im.shape[0] * s.shape[0])
         return cost_s.sum() + cost_im.sum()
+
+class NSCLoss(nn.Module):
+
+    def __init__(self, temperature, use_cosine_similarity):
+        super(NSCLoss, self).__init__()
+        self.temperature = temperature
+        self.softmax = th.nn.Softmax(dim=-1)
+        self.similarity_function = self._get_similarity_function(use_cosine_similarity)
+        self.criterion = th.nn.CrossEntropyLoss(reduction="sum")
+        self.pdist = pdist = nn.PairwiseDistance(p=2)
+
+
+    def _get_similarity_function(self, use_cosine_similarity):
+        if use_cosine_similarity:
+            self._cosine_similarity = th.nn.CosineSimilarity(dim=-1)
+            return self._cosine_simililarity
+        else:
+            return self._dot_simililarity
+
+    def _get_correlated_mask(self):
+        diag = np.eye(2 * self.batch_size)
+        l1 = np.eye((2 * self.batch_size), 2 * self.batch_size, k=-self.batch_size)
+        l2 = np.eye((2 * self.batch_size), 2 * self.batch_size, k=self.batch_size)
+        mask = th.from_numpy((diag + l1 + l2))
+        mask = (1 - mask).type(th.bool)
+        return mask.cuda(non_blocking=True)
+
+    @staticmethod
+    def _dot_simililarity(x, y):
+        v = th.tensordot(x.unsqueeze(1), y.T.unsqueeze(0), dims=2)
+        # x shape: (N, 1, C)
+        # y shape: (1, C, 2N)
+        # v shape: (N, 2N)
+        return v
+
+    def _cosine_simililarity(self, x, y):
+        # x shape: (N, 1, C)
+        # y shape: (1, 2N, C)
+        # v shape: (N, 2N)
+        v = self._cosine_similarity(x.unsqueeze(1), y.unsqueeze(0))
+        return v
+
+    def _normalize_max(self, x, axis=-1):
+        # from https://github.com/LvWilliam/EWTH_Loss/blob/main/BoT/triplet_loss.py
+        """Normalizing to unit length along the specified dimension.
+        Args:
+        x: pytorch Variable
+        Returns:
+        x: pytorch Variable, same shape as input
+        """
+        dis = th.sum(x.pow(2), dim=1).sqrt()
+        m, _ = th.max(dis, 0)
+        x = x / m
+        return x
+
+    def _normalize(self, x, axis=-1):
+        """Normalizing to unit length along the specified dimension.
+        Args:
+        x: pytorch Variable
+        Returns:
+        x: pytorch Variable, same shape as input
+        """
+        x = 1. * x / (th.norm(x, 2, axis, keepdim=True).expand_as(x) + 1e-12)
+        return x
+    # def forward(self, zjs, zis, x=0, y=0):
+    #     # print("===> ", zjs.shape, zis.shape, x.shape, y.shape)
+    #     logits_1 = self.forward_oneside(zjs, zis)
+    #     logits_2 = self.forward_oneside(zis, zjs)
+    #     labels = th.zeros(2 * self.batch_size).cuda(non_blocking=True).long()
+    #     # print(labels)
+    #     loss = (self.criterion(logits_1, labels) + self.criterion(logits_2, labels) ) /2
+    #     return loss / (2 * zjs.shape[0])
+
+    def forward(self, zjs, zis):
+        zjs = self._normalize_max(zjs, axis=-1)
+        zis = self._normalize_max(zis, axis=-1)
+
+        representations = th.cat([zjs, zis], dim=0)
+        self.batch_size = zis.shape[0]
+
+        similarity_matrix = self.similarity_function(representations, representations)
+
+        # print(similarity_matrix.shape)
+        # filter out the scores from the positive samples
+        l_pos = th.diag(similarity_matrix, self.batch_size)
+        r_pos = th.diag(similarity_matrix, -self.batch_size)
+
+        self.mask_samples_from_same_repr = self._get_correlated_mask().type(th.bool)
+        positives = th.cat([l_pos, r_pos]).view(2 * self.batch_size, 1)
+
+        negatives = similarity_matrix[self.mask_samples_from_same_repr].view(2 * self.batch_size, -1)
+
+        logits = th.cat((positives, negatives), dim=1)
+        # print(logits.shape, positives.shape, negatives.shape, zjs.shape, "==>")
+        logits /= self.temperature
+        labels = th.zeros(2 * self.batch_size).cuda(non_blocking=True).long()
+        loss = self.criterion(logits, labels)
+        # import pdb; pdb.set_trace()
+        # pdist = self.pdist(zjs1, zis1)
+        # cost_ml = pdist.mean()
+        return loss / (2 * self.batch_size) #+  cost_ml
+
+class NTXentLoss(nn.Module):
+
+    def __init__(self, temperature, use_cosine_similarity):
+        super(NTXentLoss, self).__init__()
+        self.temperature = temperature
+        self.softmax = th.nn.Softmax(dim=-1)
+        self.similarity_function = self._get_similarity_function(use_cosine_similarity)
+        self.criterion = th.nn.CrossEntropyLoss(reduction="sum")
+        self.pdist = pdist = nn.PairwiseDistance(p=2)
+
+
+    def _get_similarity_function(self, use_cosine_similarity):
+        if use_cosine_similarity:
+            self._cosine_similarity = th.nn.CosineSimilarity(dim=-1)
+            return self._cosine_simililarity
+        else:
+            return self._dot_simililarity
+
+    def _get_correlated_mask(self):
+        diag = np.eye(2 * self.batch_size)
+        l1 = np.eye((2 * self.batch_size), 2 * self.batch_size, k=-self.batch_size)
+        l2 = np.eye((2 * self.batch_size), 2 * self.batch_size, k=self.batch_size)
+        mask = th.from_numpy((diag + l1 + l2))
+        mask = (1 - mask).type(th.bool)
+        return mask.cuda(non_blocking=True)
+
+    @staticmethod
+    def _dot_simililarity(x, y):
+        v = th.tensordot(x.unsqueeze(1), y.T.unsqueeze(0), dims=2)
+        # x shape: (N, 1, C)
+        # y shape: (1, C, 2N)
+        # v shape: (N, 2N)
+        return v
+
+    def _cosine_simililarity(self, x, y):
+        # x shape: (N, 1, C)
+        # y shape: (1, 2N, C)
+        # v shape: (N, 2N)
+        v = self._cosine_similarity(x.unsqueeze(1), y.unsqueeze(0))
+        return v
+
+    def _normalize_max(self, x, axis=-1):
+        # from https://github.com/LvWilliam/EWTH_Loss/blob/main/BoT/triplet_loss.py
+        """Normalizing to unit length along the specified dimension.
+        Args:
+        x: pytorch Variable
+        Returns:
+        x: pytorch Variable, same shape as input
+        """
+        dis = th.sum(x.pow(2), dim=1).sqrt()
+        m, _ = th.max(dis, 0)
+        x = x / m
+        return x
+
+    def _normalize(self, x, axis=-1):
+        """Normalizing to unit length along the specified dimension.
+        Args:
+        x: pytorch Variable
+        Returns:
+        x: pytorch Variable, same shape as input
+        """
+        x = 1. * x / (torch.norm(x, 2, axis, keepdim=True).expand_as(x) + 1e-12)
+        return x
+    def forward(self, zjs, zis, x=0, y=0):
+        logits_1 = self.forward_oneside(zjs, zis)
+        # logits_2 = self.forward_oneside(zis, zjs)
+        labels = th.zeros(2 * self.batch_size).cuda(non_blocking=True).long()
+        loss = self.criterion(logits_1, labels) #+ self.criterion(logits_2, labels) ) /2
+        return loss 
+
+    def forward_oneside(self, zjs, zis):
+        # zjs = self._normalize_max(zjs1, axis=-1)
+        # zis = self._normalize_max(zis1, axis=-1)
+        representations = th.cat([zjs, zis], dim=0)
+        self.batch_size = zis.shape[0]
+
+        similarity_matrix = self.similarity_function(representations, representations)
+
+        # filter out the scores from the positive samples
+        l_pos = th.diag(similarity_matrix, self.batch_size)
+        r_pos = th.diag(similarity_matrix, -self.batch_size)
+
+        self.mask_samples_from_same_repr = self._get_correlated_mask().type(th.bool)
+        positives = th.cat([l_pos, r_pos]).view(2 * self.batch_size, 1)
+
+        negatives = similarity_matrix[self.mask_samples_from_same_repr].view(2 * self.batch_size, -1)
+
+        logits = th.cat((positives, negatives), dim=1)
+        logits /= self.temperature
+
+
+        # pdist = self.pdist(zjs1, zis1)
+        # cost_ml = pdist.mean()
+        return logits #loss / (2 * self.batch_size) #+  cost_ml
+
+class MILNCELoss(th.nn.Module):
+    def __init__(self):
+        super(MILNCELoss, self).__init__()
+
+    def forward(self, video_embd, text_embd, x=0, y=0):
+        x = th.matmul(video_embd, text_embd.t())
+        x = x.view(video_embd.shape[0], video_embd.shape[0], -1)
+        nominator = x * th.eye(x.shape[0])[:,:,None].cuda()
+        nominator = nominator.sum(dim=1)
+        nominator = th.logsumexp(nominator, dim=1)
+        denominator = th.cat((x, x.permute(1,0,2)), dim=1).view(x.shape[0], -1)
+        denominator = th.logsumexp(denominator, dim=1)
+        return th.mean(denominator - nominator)
+
+class DCL(th.nn.Module):
+    def __init__(self):
+        super(DCL, self).__init__()
+
+    def get_negative_mask(self, batch_size):
+        negative_mask = th.ones((batch_size, 2 * batch_size), dtype=bool)
+        for i in range(batch_size):
+            negative_mask[i, i] = 0
+            negative_mask[i, i + batch_size] = 0
+
+        negative_mask = th.cat((negative_mask, negative_mask), 0)
+        return negative_mask
+
+    def forward(self, video_embd, text_embd, x=0, y=0):
+        batch_size = video_embd.shape[0]
+        temperature = 0.1
+        tau_plus = 0.01
+        debiased = 1
+       # neg score
+        out = th.cat([video_embd, text_embd], dim=0)
+        neg = th.exp(th.mm(out, out.t().contiguous()) / temperature)
+        mask = self.get_negative_mask(batch_size).cuda()
+        neg = neg.masked_select(mask).view(2 * batch_size, -1)
+
+        # pos score
+        pos = th.exp(th.sum(video_embd * text_embd, dim=-1) / temperature)
+        pos = th.cat([pos, pos], dim=0)
+
+        # estimator g()
+        if debiased:
+            N = batch_size * 2 - 2
+            Ng = (-tau_plus * N * pos + neg.sum(dim = -1)) / (1 - tau_plus)
+            # constrain (optional)
+            Ng = th.clamp(Ng, min = N * np.e**(-1 / temperature))
+        else:
+            Ng = neg.sum(dim=-1)
+
+        # contrastive loss
+        loss = (- th.log(pos / (pos + Ng) )).mean()
+        return loss
+
+class CrossCLR(nn.Module):
+    """
+    CrossCLR Loss between 2 groups of embeddings
+    """
+    def __init__(self, temperature=0.03, temperature_weights=0.0035, negative_weight=0.8, 
+    score_thrshold=0.8, out_emb_dim=384, org_vid_dim=512, org_txt_dim=1536, K=3000, logger = None):
+        super().__init__()
+        self.logit_scale = nn.Parameter(th.ones([]))
+        self.criterion = th.nn.CrossEntropyLoss(reduction='none') 
+        self.temperature = temperature 
+        self.logger = logger
+        self.queue_is_full = False
+        self.batch_start = 0
+        self.batch_end = 10
+        self.K = 3000
+        self.score_thrshold = score_thrshold
+        self.temp_w = temperature_weights # Temperature for scaling weights. 
+        self.negative_w = negative_weight # Weight of negative scores.
+
+
+        # create the queue
+        self.register_buffer("queue_vid", th.randn(out_emb_dim, self.K ))
+        self.register_buffer("queue_txt", th.randn(out_emb_dim, self.K ))
+        self.register_buffer("queue_vid_org", th.randn(org_vid_dim, self.K ))
+        self.register_buffer("queue_txt_org", th.randn(org_txt_dim, self.K ))
+
+        self.queue_vid = nn.functional.normalize(self.queue_vid, dim=0)
+        self.queue_txt = nn.functional.normalize(self.queue_txt, dim=0)
+        self.queue_vid_org = nn.functional.normalize(self.queue_vid_org, dim=0)
+        self.queue_txt_org = nn.functional.normalize(self.queue_txt_org, dim=0)
+        self.register_buffer("queue_full", th.ones(self.K, dtype=th.long) * -1)
+        self.register_buffer("queue_ptr", th.zeros(1, dtype=th.long))
+
+
+    def _get_positive_mask(self, batch_size):
+        diag = np.eye(batch_size)
+        mask = th.from_numpy((diag))
+        mask = (1 - mask)
+        return mask.cuda(non_blocking=True)
+
+    def _get_positive_mask_bank(self, k, batch_size, ptr_start, ptr_end):
+        diag = np.eye(batch_size)
+        mask = th.from_numpy((diag))
+        # mask = (1 - mask)
+
+        diag_bank = np.ones((batch_size, k))
+        mask_bank = th.from_numpy((diag_bank))
+        mask_bank[:, ptr_start:ptr_end] -= mask[:,:ptr_end-ptr_start]
+
+        return mask_bank.cuda(non_blocking=True)
+
+    @th.no_grad()
+    def _dequeue_and_enqueue(self, keys_vid, keys_txt, keys_vid_org, keys_txt_org):
+
+
+        batch_size = keys_vid.shape[0]
+
+        ptr = int(self.queue_ptr)
+        ptr_end = ptr+batch_size
+        ptr_end_k = batch_size
+        if (ptr+batch_size) > self.K:
+            ptr_end = self.K
+            ptr_end_k = self.K - (ptr + batch_size)
+
+        ptr_x = ptr
+        if ptr_end_k != batch_size:
+            ptr_x = ptr + ptr_end_k
+
+        self.queue_vid[:, ptr_x:ptr_x+batch_size] = keys_vid.T
+        self.queue_txt[:, ptr_x:ptr_x+batch_size] = keys_txt.T
+
+        self.queue_vid_org[:, ptr:ptr_end] = keys_vid_org.T[:, :ptr_end_k]
+        self.queue_txt_org[:, ptr:ptr_end] = keys_txt_org.T[:, :ptr_end_k]
+        self.queue_full[ptr:ptr_end] = th.ones_like(keys_vid.T[0, :ptr_end_k])
+        self.batch_start = ptr_x
+        self.batch_end = ptr_x + batch_size
+
+        if (ptr+batch_size) >= self.K:
+            ptr = 0
+        else:
+            ptr = (ptr + batch_size) 
+
+        self.queue_ptr[0] = ptr
+
+    def forward(self, video_features, text_features, input_vid, input_txt):
+        """
+        Inputs shape (batch, embed_dim)
+
+        Args:
+            im: Visual embeddings (batch, embed_dim)
+            s: Text embeddings (batch, embed_dim)
+
+        Returns:
+        """
+
+        input_vid = th.mean(input_vid, dim=1)
+        input_txt = th.mean(input_txt, dim=1)
+
+        video_features = nn.functional.normalize(video_features, dim=1)
+        text_features = nn.functional.normalize(text_features, dim=1)
+
+        self._dequeue_and_enqueue(video_features, text_features, input_vid, input_txt)
+
+        if not self.queue_is_full:
+            self.queue_is_full = th.all(self.queue_full != -1)
+            if self.queue_is_full: print('\n===== queue is full now =====')
+            
+
+        logits_per_image = video_features @ text_features.t()
+        logits_per_text = text_features @ video_features.t()
+
+
+        if self.queue_is_full:
+            logits_clstr_vid = video_features @ self.queue_vid.detach().cuda()
+            logits_clstr_txt = text_features @ self.queue_txt.detach().cuda()
+
+            sim_scores_vid = (input_vid @ self.queue_vid_org.cuda()) 
+            sim_scores_txt= (input_txt @ self.queue_txt_org.cuda()) 
+            sim_scores_vid_g = (self.queue_vid_org.t().cuda() @ self.queue_vid_org.cuda()) 
+            sim_scores_txt_g= (self.queue_txt_org.t().cuda() @ self.queue_txt_org.cuda()) 
+            positive_mask =  self._get_positive_mask_bank(self.K, video_features.shape[0], self.batch_start, self.batch_end)
+            positive_mask_g =  self._get_positive_mask(sim_scores_txt_g.shape[1]).type(th.bool)
+
+            ind_start = self.batch_start
+
+        else:
+            sim_scores_vid = (input_vid @ input_vid.t()) 
+            sim_scores_txt = (input_txt @ input_txt.t()) 
+            sim_scores_vid_g = (input_vid @ input_vid.t()) 
+            sim_scores_txt_g = (input_txt @ input_txt.t()) 
+            logits_clstr_vid = video_features @ video_features.t()
+            logits_clstr_txt = text_features @ text_features.t()
+            positive_mask =  self._get_positive_mask(logits_clstr_vid.shape[0]).type(th.bool)
+            positive_mask_g =  self._get_positive_mask(sim_scores_txt_g.shape[1]).type(th.bool)
+
+            ind_start = 0
+
+
+        logits_clstr_vid = logits_clstr_vid * positive_mask
+        logits_clstr_txt = logits_clstr_txt * positive_mask
+        sim_scores_vid = sim_scores_vid * positive_mask
+        sim_scores_txt = sim_scores_txt * positive_mask
+
+        sim_scores_vid_g = sim_scores_vid_g * positive_mask_g
+        sim_scores_txt_g = sim_scores_txt_g * positive_mask_g
+
+        logits_per_image /= self.temperature #* self.logit_scale.exp()
+        logits_per_text /= self.temperature #* self.logit_scale.exp()
+        logits_clstr_vid /= self.temperature #* self.logit_scale.exp()
+        logits_clstr_txt /= self.temperature #* self.logit_scale.exp()
+
+
+        # Find influential samples and calculate scores 
+        avg_sim_vid = th.mean(sim_scores_vid,dim=1)
+        avg_sim_txt = th.mean(sim_scores_txt,dim=1)
+        avg_sim_vid_g = th.mean(sim_scores_vid_g,dim=0)
+        avg_sim_txt_g = th.mean(sim_scores_txt_g,dim=0)
+
+        sorted_vid, indices_vid = th.sort(avg_sim_vid_g)
+        sorted_txt, indices_txt = th.sort(avg_sim_txt_g)
+        sorted_vid = sorted_vid / sorted_vid.max(dim=-1, keepdim=True)[0]
+        sorted_txt = sorted_txt / sorted_txt.max(dim=-1, keepdim=True)[0]
+
+
+        # ======================================================
+        # Find index of influential samples and remove them from negative set
+        indices_vid_thrsh = indices_vid[sorted_vid<self.score_thrshold]# + ind_start
+        indices_txt_thrsh = indices_txt[sorted_txt<self.score_thrshold]# + ind_start 
+
+        # logits_clstr_vid[:, indices_vid_thrsh] = 0 #- np.inf
+        # logits_clstr_txt[:, indices_txt_thrsh] = 0 #- np.inf
+        negatives_vid = logits_clstr_vid[:, indices_vid_thrsh]
+        negatives_txt = logits_clstr_txt[:, indices_txt_thrsh]
+
+        # Logits = [positive_logits, w*negative_logits]
+        img_logits_prune = th.cat([logits_per_image, self.negative_w * negatives_vid], dim=1)
+        txt_logits_prune = th.cat([logits_per_text, self.negative_w * negatives_txt], dim=1)
+
+        # Create the labels and calculate the loss
+        labels = th.arange(logits_per_image.shape[0]).cuda()
+        
+        loss_i = self.criterion(img_logits_prune, labels)
+        loss_t = self.criterion(txt_logits_prune, labels)
+
+        # Weight the losses based on the scores computed by influential samples
+        w_i =  ((avg_sim_vid/sum(avg_sim_vid)))
+        w_t = ((avg_sim_txt/sum(avg_sim_txt)))
+        loss_i = loss_i * th.exp(w_i/ self.temp_w)
+        loss_t = loss_t * th.exp(w_t/ self.temp_w)
+
+        loss_i = sum(loss_i) / (sum(th.exp(w_i/ self.temp_w)))
+        loss_t = sum(loss_t) / (sum(th.exp(w_t/ self.temp_w)))
+
+        loss = ((loss_i + loss_t)  )  / 2
+
+        return loss
+
+
+class CLIP(nn.Module):
+    """
+    Regular Contrastive Loss between 2 groups of embeddings
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.logit_scale = nn.Parameter(th.ones([]))
+        # self.criterion = th.nn.CrossEntropyLoss(reduction="sum")
+        self.criterion = th.nn.CrossEntropyLoss()
+        self.temperature = 0.07 #0.04
+
+    def forward(self, image_features, text_features):
+        """
+        Inputs shape (batch, embed_dim)
+
+        Args:
+            im: Visual embeddings (batch, embed_dim)
+            s: Text embeddings (batch, embed_dim)
+
+        Returns:
+        """
+        # normalized features
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        # cosine similarity as logits
+        # logit_scale = self.logit_scale.exp()
+        # logits_per_iamge = logit_scale * image_features @ text_features.t()
+        # logits_per_text = logit_scale * text_features @ image_features.t()
+
+        logits_per_iamge = image_features @ text_features.t()
+        logits_per_text = text_features @ image_features.t()
+        # logits_per_iamge /= (self.temperature * self.logit_scale.exp())
+        # logits_per_text /= (self.temperature * self.logit_scale.exp())
+        logits_per_iamge /= (self.temperature)
+        logits_per_text /= (self.temperature)
+
+        # logits = torch.matmul(img_feats, text_feats.T) * torch.exp(self.temperature_factor)
+
+        labels = th.arange(image_features.shape[0]).cuda()
+        # print(labels)
+
+        loss_i = self.criterion(logits_per_iamge, labels)
+        loss_t = self.criterion(logits_per_text, labels)
+
+        loss = (loss_i.mean() + loss_t.mean()) / 2.
+        return loss
+
+class ContrastiveLoss_v1(nn.Module):
+    """
+    Regular Contrastive Loss between 2 groups of embeddings
+    """
+
+    def __init__(self, margin: float, max_violation: bool = False, norm: bool = True, use_cuda: bool = True):
+        super().__init__()
+        self.margin = margin
+        self.sim = cosine_sim
+        self.norm = norm
+        self.max_violation = max_violation
+        self.use_cuda = use_cuda
+
+    def _pdist(self, A, B):
+        prod = th.mm(A, B.t())
+        norm = prod.diag().unsqueeze(1).expand_as(prod)
+        res = (norm + norm.t() - 2 * prod).clamp(min = 0)
+        return res.sqrt()
+
+    def forward(self, im, s):
+        """
+        Inputs shape (batch, embed_dim)
+
+        Args:
+            im: Visual embeddings (batch, embed_dim)
+            s: Text embeddings (batch, embed_dim)
+
+        Returns:
+        """
+        # compute image-sentence score matrix - how close is im(y) to s(x)
+        scores = self.sim(im, s)
+        # distances = self._pdist(im, s)
+        diagonal = scores.diag().view(im.size(0), 1)
+        d1 = diagonal.expand_as(scores)
+        d2 = diagonal.t().expand_as(scores)
+
+        # compare every diagonal score to scores in its column
+        # caption retrieval
+        cost_s = (self.margin + scores - d1).clamp(min=0)
+        # compare every diagonal score to scores in its row
+        # image retrieval
+        cost_im = (self.margin + scores - d2).clamp(min=0)
+
+        # clear diagonals, where there is just the margin left
+        mask: th.Tensor = th.eye(scores.shape[0]).bool()
+        if self.use_cuda:
+            mask = mask.cuda(non_blocking=True)
+        cost_s = cost_s.masked_fill_(mask, 0)
+        cost_im = cost_im.masked_fill_(mask, 0)
+
+        # keep the maximum violating negative for each query
+        if self.max_violation:
+            cost_s = cost_s.max(1)[0]
+            cost_im = cost_im.max(0)[0]
+
+        num_neg = 10
+        neg_id = th.argsort(scores, dim=0, descending=True)
+        cost_s_mask = cost_im[neg_id[:, 0:num_neg]].mean()
+
+        cost_im_mask = []
+        neg_id = th.argsort(scores, dim=1, descending=True)
+        cost_im_mask = cost_s[neg_id[0:num_neg, :]].mean()
+
+
+        # if self.norm:
+        #     return (cost_s.sum() + cost_im.sum()).div(im.shape[0] * s.shape[0])
+        return (cost_s_mask + cost_im_mask + cost_s.mean() + cost_im.mean()) / 2
 
 
 def compute_mean_distance_l2(c, s):
@@ -387,3 +969,5 @@ class CycleConsistencyLoss(nn.Module):
         # for now return all the losses, in case we want to sample some
         # sequences only
         return loss_simple_per_seq, loss_gauss_per_seq, var_reg_per_seq
+
+

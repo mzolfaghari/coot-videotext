@@ -1,0 +1,1 @@
+python train_retrieval.py -c config/retrieval/paper2020/yc2_100m_coot.yaml --exp_group deb16 -e f_normal_feat_debug --num_runs 5

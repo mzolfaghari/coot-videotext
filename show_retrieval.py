@@ -74,7 +74,9 @@ def main():
 
     # ---------- Define which metrics to print ----------
     default_metrics = []
-    default_fields = ["v2p-r1", "p2v-r1", "c2s-r1", "s2c-r1", "time (h)"]
+    # default_fields = ["v2p-r1", "p2v-r1", "c2s-r1", "s2c-r1", "time (h)"]
+    default_fields = ["c2s-r1", "c2s-r5", "c2s-r10", "s2c-r1", "s2c-r5", "s2c-r10", "time (h)"]
+
     output_results(collector, custom_metrics=retrieval_metrics, metrics=args.metrics, default_metrics=default_metrics,
                    fields=args.fields, default_fields=default_fields, mean=args.mean, mean_all=args.mean_all,
                    sort=args.sort, sort_asc=args.sort_asc,

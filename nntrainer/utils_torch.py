@@ -75,9 +75,9 @@ def set_seed(seed: int, set_deterministic: bool = True):
         cudnn.benchmark = False
         cudnn.deterministic = True
     elif cudnn.benchmark or not cudnn.deterministic:
-        print(f"WARNING: Despite fixed seed {seed}, training may not be deterministic with {cudnn.benchmark=} "
-              f"(must be False for deterministic training) and {cudnn.deterministic=} (must be True for deterministic "
-              f"training)")
+        print("WARNING: Despite fixed seed {}, training may not be deterministic with {} "
+              "(must be False for deterministic training) and {} (must be True for deterministic "
+              "training)".format(seed, cudnn.benchmark, cudnn.deterministic))
 
 
 def get_truncnorm_tensor(shape: Tuple[int], *, mean: float = 0, std: float = 1, limit: float = 2) -> th.Tensor:

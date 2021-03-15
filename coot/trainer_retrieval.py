@@ -17,11 +17,13 @@ from tqdm import tqdm
 
 from coot import loss_fn, model_retrieval
 from coot.configs_retrieval import (
-    CootMetersConst as CMeters, ExperimentTypesConst, RetrievalConfig, RetrievalTrainerState)
+    CootMetersConst as CMeters, ExperimentTypesConst, RetrievalConfig, RetrievalTrainerState, RetrievalNetworksConst)
 from coot.dataset_retrieval import RetrievalDataBatchTuple
-from coot.loss_fn import ContrastiveLoss, CycleConsistencyLoss
+from coot.loss_fn_ok import ContrastiveLoss, CLIP, MILNCELoss, NTXentLoss, CrossCLR, DCL
+
 from nntrainer import lr_scheduler, optimization, retrieval, trainer_base
 
+avg_clip_acc = []
 
 class RetrievalTrainer(trainer_base.BaseTrainer):
     """
@@ -76,6 +78,15 @@ class RetrievalTrainer(trainer_base.BaseTrainer):
         assert self.cfg.train.loss_func == loss_fn.LossesConst.CONTRASTIVE
         self.loss_contr = ContrastiveLoss(self.cfg.train.contrastive_loss_config.margin, use_cuda=self.cfg.use_cuda)
 
+        self.loss_clip = CrossCLR(self.cfg.train.cross_clr_config.temperature, self.cfg.train.cross_clr_config.temperature_weights,
+        self.cfg.train.cross_clr_config.negative_weight, self.cfg.train.cross_clr_config.score_thrshold, 
+        self.cfg.model_cfgs[RetrievalNetworksConst.NET_TEXT_LOCAL].output_dim, self.cfg.dataset_val.vid_feat_dim, 
+        self.cfg.dataset_val.text_feat_dim, self.cfg.train.cross_clr_config.queue_size, self.logger)
+
+        # self.loss_clip = ContrastiveLoss(self.cfg.train.contrastive_loss_config.margin, use_cuda=self.cfg.use_cuda) #NTXentLoss(0.09, 1) #CrossCLR() #DCL() #MILNCELoss() #CrossCLR() #NSCLoss(0.09, 1) #NTXentLoss(0.09, 1) #NTXentLoss(0.15, 1) #CLIP_Cluster() #NTXentLoss(0.01, 1) #MILNCELoss() #CLIP_Cluster() #Temp
+        self.loss_vid = ContrastiveLoss(self.cfg.train.contrastive_loss_config.margin, use_cuda=self.cfg.use_cuda)
+
+
         # cycle consistency
         if self.cfg.train.loss_cycle_cons != 0:
             self.loss_cycle_cons = CycleConsistencyLoss(use_cuda=self.cfg.use_cuda)
@@ -118,7 +129,7 @@ class RetrievalTrainer(trainer_base.BaseTrainer):
         # post init hook for checkpoint loading
         self.hook_post_init()
 
-    def compute_align_loss(self, visual_emb: th.Tensor, text_emb: th.Tensor) -> th.Tensor:
+    def compute_align_loss_clip(self, visual_emb: th.Tensor, text_emb: th.Tensor, input_img=None, input_txt=None, epoch=0) -> th.Tensor:
         """
         Compute alignment contrastive loss (Matching between visual and text features).
 
@@ -129,7 +140,21 @@ class RetrievalTrainer(trainer_base.BaseTrainer):
         Returns:
             Scalar loss.
         """
-        return self.loss_contr(visual_emb, text_emb)
+        return self.loss_clip(visual_emb, text_emb, input_img, input_txt, epoch) #self.loss_contr(visual_emb, text_emb)
+
+    def compute_align_loss_vid(self, visual_emb: th.Tensor, text_emb: th.Tensor, input_img=None, input_txt=None) -> th.Tensor:
+        """
+        Compute alignment contrastive loss (Matching between visual and text features).
+
+        Args:
+            visual_emb: Video or Clip embedding of shape (num_emb, emb_dim)
+            text_emb: Paragraph or Text embedding of shape (num_emb, emb_dim)
+
+        Returns:
+            Scalar loss.
+        """
+        return self.loss_vid(visual_emb, text_emb, input_img, input_txt) #self.loss_contr(visual_emb, text_emb)
+
 
     def compute_cluster_loss(self, visual_emb: th.Tensor, text_emb: th.Tensor) -> th.Tensor:
         """
@@ -145,7 +170,7 @@ class RetrievalTrainer(trainer_base.BaseTrainer):
         return (self.loss_contr(visual_emb, visual_emb) + self.loss_contr(text_emb, text_emb)) / 2
 
     def compute_total_constrastive_loss(self, visual_data: model_retrieval.RetrievalVisualEmbTuple,
-                                        text_data: model_retrieval.RetrievalTextEmbTuple) -> th.Tensor:
+                                        text_data: model_retrieval.RetrievalTextEmbTuple, batch,epch) -> th.Tensor:
         """
         Compute total contrastive loss depending on config.
 
@@ -164,14 +189,19 @@ class RetrievalTrainer(trainer_base.BaseTrainer):
         sent_emb_norm = F.normalize(text_data.sent_emb)
         par_emb_norm = F.normalize(text_data.par_emb)
         # sum weighted alignments and clustering losses
+
+        clip_org_norm = F.normalize(batch.clip_feat)
+        sent_org_norm = F.normalize(batch.sent_feat)
+
+
         cfg = self.cfg.train.contrastive_loss_config
         loss = 0
         if cfg.weight_high != 0:
-            loss += cfg.weight_high * self.compute_align_loss(vid_emb_norm, par_emb_norm)
+            loss += cfg.weight_high * self.compute_align_loss_vid(vid_emb_norm, par_emb_norm, batch.vid_feat, batch.par_feat)
         if cfg.weight_low != 0:
-            loss += cfg.weight_low * self.compute_align_loss(clip_emb_norm, sent_emb_norm)
+            loss += cfg.weight_low * self.compute_align_loss_clip(clip_emb_norm, sent_emb_norm, clip_org_norm.mean(dim=1), sent_org_norm.mean(dim=1), epch)
         if cfg.weight_context != 0:
-            loss += cfg.weight_context * self.compute_align_loss(vid_context_norm, par_context_norm)
+            loss += cfg.weight_context * self.compute_align_loss_vid(vid_context_norm, par_context_norm, batch.vid_feat, batch.par_feat)
         if cfg.weight_high_internal != 0:
             loss += cfg.weight_high_internal * self.compute_cluster_loss(vid_emb_norm, par_emb_norm)
         if cfg.weight_low_internal != 0:
@@ -231,7 +261,7 @@ class RetrievalTrainer(trainer_base.BaseTrainer):
                 with autocast(enabled=self.cfg.fp16_train):
                     visual_data = self.model_mgr.encode_visual(batch)
                     text_data = self.model_mgr.encode_text(batch)
-                    contr_loss = self.compute_total_constrastive_loss(visual_data, text_data)
+                    contr_loss = self.compute_total_constrastive_loss(visual_data, text_data, batch, _epoch)
                     cc_loss = self.compute_cyclecons_loss(visual_data, text_data)
                     loss = contr_loss + cc_loss
 
@@ -298,6 +328,7 @@ class RetrievalTrainer(trainer_base.BaseTrainer):
         # decide what to collect
         save_clip_num, save_sent_num, save_key = [], [], []
         collect_keys = ["vid_emb", "par_emb"]
+        
         if val_clips or save_embs:
             # clips can be requested for validation and when saving embeddings
             collect_keys += ["clip_emb", "sent_emb"]
@@ -325,7 +356,7 @@ class RetrievalTrainer(trainer_base.BaseTrainer):
             with autocast(enabled=self.cfg.fp16_val):
                 visual_data = self.model_mgr.encode_visual(batch)
                 text_data = self.model_mgr.encode_text(batch)
-                contr_loss = self.compute_total_constrastive_loss(visual_data, text_data)
+                contr_loss = self.compute_total_constrastive_loss(visual_data, text_data, batch, 0)
                 contr_loss_total += contr_loss
                 cc_loss = self.compute_cyclecons_loss(visual_data, text_data)
                 cc_loss_total += cc_loss
@@ -344,11 +375,24 @@ class RetrievalTrainer(trainer_base.BaseTrainer):
                     data_collector[key] = [emb.data.cpu()]
                 else:
                     data_collector[key] += [emb.data.cpu()]
+
+            # Collect sentences to compute failure statistics
+            collect_keys_org = [ "sent_feat", "clip_feat"]
+            if data_collector.get("sentences") is None:
+                data_collector["sentences"] = [batch.sentences]
+                data_collector["clip_feat"] = [th.mean(batch.clip_feat.data.cpu(), dim=1)]
+                data_collector["sent_feat"] = [th.mean(batch.sent_feat.data.cpu(), dim=1)]
+            else:
+                data_collector["sentences"] += [batch.sentences]
+                data_collector["clip_feat"] += [th.mean(batch.clip_feat.data.cpu(), dim=1)]
+                data_collector["sent_feat"] += [th.mean(batch.sent_feat.data.cpu(), dim=1)]
+
             pbar.update()
         pbar.close()
 
         # ---------- validation done ----------
-
+        for key in collect_keys_org:
+            data_collector[key] = th.cat(data_collector[key], dim=0)
         # postprocess collected embeddings
         data_collector_norm = {}
         for key in collect_keys:
@@ -381,6 +425,9 @@ class RetrievalTrainer(trainer_base.BaseTrainer):
         res_v2p, res_p2v, sum_vp_at_1, str_vp = retrieval.compute_retrieval(
             data_collector_norm, "vid_emb", "par_emb", print_fn=self.logger.info)
 
+        # hist_failures_words = retrieval.compute_failures(
+        #         data_collector_norm, "vid_emb", "par_emb", data_collector["sentences"], print_fn=self.logger.info)
+        # import pdb; pdb.set_trace()
         # calculate clip-sentence retrieval and print output table
         res_c2s, res_s2c, sum_cs_at_1, clipsent_results = None, None, None, None
         str_cs = ""
@@ -388,6 +435,16 @@ class RetrievalTrainer(trainer_base.BaseTrainer):
             res_c2s, res_s2c, sum_cs_at_1, str_cs = retrieval.compute_retrieval(
                 data_collector_norm, "clip_emb", "sent_emb", print_fn=self.logger.info)
             clipsent_results = (res_c2s, res_s2c, sum_cs_at_1)
+            # avg_clip_acc.append(sum_cs_at_1)
+            # print("==="*20)
+            # print(avg_clip_acc)
+            # if sum_cs_at_1 > 0.06:
+            #     res_c2s2, res_s2c2, sum_cs_at_12, str_cs2 = retrieval.compute_retrieval2(data_collector,
+            #     data_collector_norm, "clip_emb", "sent_emb", print_fn=self.logger.info)
+
+            # hist_failures_words = retrieval.compute_failures(
+            #     data_collector_norm, "clip_emb", "sent_emb", data_collector["sentences"], print_fn=self.logger.info)
+
 
         # feed retrieval results to meters
         for modality, dict_ret in zip(CMeters.RET_MODALITIES, [res_v2p, res_p2v, res_c2s, res_s2c]):

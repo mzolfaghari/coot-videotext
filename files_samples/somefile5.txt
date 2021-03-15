@@ -1,0 +1,48 @@
+ boil the snails in water ;0;6
+ add oats and breadcrumbs to ground beef ;0;11
+ cook some pieces of bacon in a pan ;0;20
+ chop some red onions red pepper and green pepper into square pieces ;0;32
+ add tomatoes to the herbs ;0;42
+ preheat oven to 350 f degree ;0;45
+ wash the cabbage ;0;62
+ boil the snails in water ;1;6
+ add oats and breadcrumbs to ground beef ;1;11
+ add tomatoes to the herbs ;1;42
+ boil the snails in water ;5;6
+ add oats and breadcrumbs to ground beef ;5;11
+ add tomatoes to the herbs ;5;42
+ wash the cabbage ;5;62
+ whisk eggs and season with salt ;6;8
+ combine mint garlic sumac to a bowl with lemon juice and olive oil ;6;9
+ add oats and breadcrumbs to ground beef ;6;11
+ heat oil and add chopped onion ;6;13
+ add bratwurst sausages to a tray ;6;17
+ cook some pieces of bacon in a pan ;6;20
+ combine soy sauce brown sugar water garlic green onions and sesame oil ;6;26
+ season cooked quinoa with italian seasoning ;6;31
+ chop some red onions red pepper and green pepper into square pieces ;6;32
+ add tomatoes to the herbs ;6;42
+ preheat oven to 350 f degree ;6;45
+ add salt rice wine soy sauce and corn starch to a bowl and mix ;6;48
+ add onion paste ;6;60
+ wash the cabbage ;6;62
+ add oats and breadcrumbs to ground beef ;8;11
+ add tomatoes to the herbs ;8;42
+ wash the cabbage ;8;62
+ add oats and breadcrumbs to ground beef ;9;11
+ add tomatoes to the herbs ;9;42
+ cook some pieces of bacon in a pan ;11;20
+ chop some red onions red pepper and green pepper into square pieces ;11;32
+ add tomatoes to the herbs ;11;42
+ preheat oven to 350 f degree ;11;45
+ wash the cabbage ;11;62
+ add tomatoes to the herbs ;13;42
+ add tomatoes to the herbs ;17;42
+ add tomatoes to the herbs ;20;42
+ preheat oven to 350 f degree ;20;45
+ wash the cabbage ;20;62
+ add tomatoes to the herbs ;31;42
+ add tomatoes to the herbs ;32;42
+ preheat oven to 350 f degree ;42;45
+ wash the cabbage ;42;62
+ wash the cabbage ;45;62

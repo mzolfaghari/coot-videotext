@@ -356,6 +356,10 @@ def setup_experiment_identifier_from_args(args: argparse.Namespace, exp_type: st
         exp_group = args.exp_group
         exp_name = ".".join(str(Path(args.config_file).parts[-1]).split(".")[:-1])
         config_file = args.config_file
+
+    exp_group = args.exp_group
+    exp_name = args.exp_name
+    config_file = args.config_file
     print(f"Source config: {config_file}")
     print(f"Results path:  {args.log_dir}/{exp_type}/{exp_group}/{exp_name}")
     return exp_group, exp_name, config_file

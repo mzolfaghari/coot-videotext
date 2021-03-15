@@ -28,7 +28,7 @@ def main():
     path_data = args.data_path if args.data_path is not None else repo_config.DATA_PATH
     path_dataset = Path(path_data) / "youcook2"
     captions_path = Path("annotations") / "youcook2"
-    print(f"Working on dataset path {path_dataset} captions from {captions_path}")
+    print("Working on dataset path {} captions from {}".format(path_dataset, captions_path))
 
     # setup other paths
     meta_file = path_dataset / "meta_all.json"
@@ -50,7 +50,7 @@ def main():
         for seg in meta["annotations"]:
             # read segment fields
             time_start, time_stop = seg["segment"]
-            assert time_stop > time_start, f"Negative duration"
+            assert time_stop > time_start, "Negative duration"
             narration = seg["sentence"]
             for fix_from, fix_to in FIXES.items():
                 narration = narration.replace(fix_from, fix_to)
@@ -64,7 +64,7 @@ def main():
 
     # write meta to file
     json.dump(meta_dict, meta_file.open("wt", encoding="utf8"), sort_keys=True)
-    print(f"wrote {meta_file}")
+    print("wrote {}".format(meta_file))
 
 
 if __name__ == "__main__":

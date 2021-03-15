@@ -4,7 +4,7 @@ Configuration setup for TrainerBase. Moved to separate file to avoid circular im
 from copy import deepcopy
 from typing import Dict, List, Optional
 
-from coot.loss_fn import ContrastiveLossConfig, LossesConst
+from coot.loss_fn import ContrastiveLossConfig, CrossCLRLossConfig, LossesConst
 from nntrainer import data, lr_scheduler, optimization, typext, utils
 from nntrainer.utils import ConfigNamesConst
 
@@ -108,6 +108,7 @@ class BaseTrainConfig(typext.ConfigClass):
         assert isinstance(self.loss_func, str)
         if self.loss_func == LossesConst.CONTRASTIVE:
             self.contrastive_loss_config = ContrastiveLossConfig(config.pop("contrastive_loss_config"))
+            self.cross_clr_config = CrossCLRLossConfig(config.pop("cross_clr_config"))
         self.clip_gradient: float = config.pop("clip_gradient")
         assert isinstance(self.clip_gradient, (int, float)) and self.clip_gradient >= -1
 
